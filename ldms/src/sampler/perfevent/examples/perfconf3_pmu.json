@@ -1,0 +1,9 @@
+{
+  "template": {
+    "type": "pmu",
+    "pmus": [ "amd_iommu_0", "amd_iommu_1" ]
+  },
+  "events": [
+    { "event": "cmd_processed" }
+  ]
+}

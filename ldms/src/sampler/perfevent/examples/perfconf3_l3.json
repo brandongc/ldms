@@ -1,0 +1,7 @@
+{
+  "template": { "type": "cache", "level": 3 },
+  "events": [
+    { "event": "l3_misses" },
+    { "event": "l3_cache_accesses" }
+  ]
+}

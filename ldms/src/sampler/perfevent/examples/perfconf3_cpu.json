@@ -1,0 +1,7 @@
+{
+  "template": { "type": "cpu", "cpus": "0-3" },
+  "events": [
+    { "event": "instructions" },
+    { "event": "cpu-cycles" }
+  ]
+}

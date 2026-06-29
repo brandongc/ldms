@@ -1,0 +1,6 @@
+{
+  "template": { "type": "socket" },
+  "events": [
+    { "event": "power/energy-pkg/" }
+  ]
+}
