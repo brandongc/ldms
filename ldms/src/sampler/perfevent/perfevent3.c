@@ -2836,6 +2836,7 @@ static int config(ldmsd_plug_handle_t handle,
 	json_entity_t e_schema;
 	json_entity_t e_conf_perfdb;
 	json_entity_t e_config;
+	enum json_value_e e_type;
 	const char *c_schema;
 
 	struct perf_s *p = ldmsd_plug_ctxt_get(handle);
@@ -2871,8 +2872,20 @@ static int config(ldmsd_plug_handle_t handle,
 		goto err;
 	}
 	e_config = json_doc_root(p->config);
+	e_type = json_entity_type(e_config);
+	if (e_type != JSON_DICT_VALUE) {
+		_ERROR(p, "Expecting configuration object, but got: %s\n",
+		       json_type_name(e_type));
+		rc = EINVAL;
+		goto err;
+	}
 	e_schema = json_value_find(e_config, "schema");
 	if (e_schema) {
+		if (json_entity_type(e_schema) != JSON_STRING_VALUE) {
+			_ERROR(p, "'schema' attribute must be a string.\n");
+			rc = EINVAL;
+			goto err;
+		}
 		c_schema = json_value_cstr(e_schema);
 	} else {
 		c_schema = SAMP;
