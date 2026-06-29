@@ -1022,6 +1022,20 @@ static struct instance_s *instance_find_int_id(struct perf_s *p, enum template_t
 	return NULL;
 }
 
+static void cpu_mask_domain(struct perf_s *p, uint8_t *mask,
+			    enum template_type_e type, int id)
+{
+	int cpu, cpu_id;
+
+	cpu_mask_zero(mask);
+	for (cpu = 0; cpu < p->n_cpu && cpu < MAX_CPU; cpu++) {
+		cpu_id = (type == TEMPLATE_SOCKET) ?
+			 cpu_socket_id(p, cpu) : cpu_node_id(p, cpu);
+		if (cpu_id == id)
+			cpu_mask_set_cpu(mask, cpu);
+	}
+}
+
 static int template_build_cpu(struct perf_s *p, uint8_t *selected)
 {
 	int cpu, rc;
@@ -1099,10 +1113,8 @@ static int template_build_socket_or_node(struct perf_s *p, uint8_t *selected,
 		if (id < 0)
 			continue;
 		old = instance_find_int_id(p, type, id);
-		if (old) {
-			cpu_mask_set_cpu(old->cpu_mask, cpu);
+		if (old)
 			continue;
-		}
 		bzero(&inst, sizeof(inst));
 		inst.type = type;
 		inst.representative_cpu = cpu;
@@ -1113,7 +1125,9 @@ static int template_build_socket_or_node(struct perf_s *p, uint8_t *selected,
 		inst.cache_id = -1;
 		snprintf(inst.name, sizeof(inst.name), "%s%d", template_type_name(type), id);
 		snprintf(inst.pmu, sizeof(inst.pmu), "%s", template_type_name(type));
-		cpu_mask_set_cpu(inst.cpu_mask, cpu);
+		cpu_mask_domain(p, inst.cpu_mask, type, id);
+		if (cpu_mask_first(p, inst.cpu_mask) < 0)
+			cpu_mask_set_cpu(inst.cpu_mask, cpu);
 		rc = instance_add(p, &inst);
 		if (rc)
 			return rc;
