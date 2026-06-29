@@ -61,6 +61,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <inttypes.h>
+#include <ctype.h>
 #include <time.h>
 #include <dirent.h>
 #include <regex.h>
@@ -76,10 +77,6 @@
 #include <linux/perf_event.h>    /* Definition of PERF_* constants */
 #include <linux/hw_breakpoint.h> /* Definition of HW_* constants */
 #include <sys/syscall.h>         /* Definition of SYS_* constants */
-
-#include <ftw.h>
-#include <dlfcn.h>
-
 
 #include "ovis_json/ovis_json.h"
 
@@ -108,9 +105,26 @@
 #define unlikely(cond) __builtin_expect(!!(cond), 0)
 
 #define SAMP "perfevent3"
+/* These sizes define local buffers and the visible record string fields. */
 #define MAX_CPU 1024
+#define INSTANCE_TYPE_SZ 32
+#define LDMS_NAME_SZ 128
+#define PMU_NAME_SZ 256
+#define CPU_MODEL_SZ 256
+#define SMALL_BUF_SZ 64
+#define NUMBER_BUF_SZ 64
+#define SYSFS_BUF_SZ 4096
 #define PMU_EVENT_NAME_SZ 256
 #define PMU_EVENT_VALUE_SZ 512
+#define PMU_FORMAT_NAME_SZ 128
+#define PMU_FORMAT_SCAN_MAX 127
+#define PMU_EVENT_SCAN_MAX 255
+#define PMU_FORMAT_BITS 64
+#define CPUINFO_LINE_SZ 256
+#define CPUINFO_FIELD_SZ 64
+#define MODEL_REGEX_SZ 1024
+#define SCAN_STR_HELPER(_x) #_x
+#define SCAN_STR(_x) SCAN_STR_HELPER(_x)
 
 enum template_type_e {
 	TEMPLATE_UNSET = 0,
@@ -124,8 +138,8 @@ enum template_type_e {
 struct instance_s {
 	uint32_t index;
 	enum template_type_e type;
-	char name[128];
-	char pmu[128];
+	char name[LDMS_NAME_SZ];
+	char pmu[LDMS_NAME_SZ];
 	int representative_cpu;
 	int socket_id;
 	int die_id;
@@ -141,7 +155,7 @@ struct event_rec_s {
 	json_entity_t conf_event;
 	char name[PMU_EVENT_NAME_SZ];
 	char event_spec[PMU_EVENT_VALUE_SZ];
-	char pmu[128];
+	char pmu[LDMS_NAME_SZ];
 	pid_t pid;
 	int is_scaled;
 	ldms_mval_t rec_mval;
@@ -159,11 +173,6 @@ struct counter_s {
 	int   instance_idx;
 	int   fd; /* from perf_event_open() */
 	ldms_mval_t mval; /* mval to event_rec->values[instance_idx] */
-};
-
-struct dev_s {
-	TAILQ_ENTRY(counter_s) entry;
-	TAILQ_HEAD(, counter_s) counter_tq;
 };
 
 /* perf instance ctxt */
@@ -191,7 +200,7 @@ struct perf_s {
 
 	int n_cpu; /* number of CPUs */
 
-	char cpu_model[256];
+	char cpu_model[CPU_MODEL_SZ];
 
 	int n_counters; /* count specific event-cpu-pid */
 	int n_events;  /* events with unscaled counter */
@@ -217,8 +226,6 @@ struct perf_s {
 	int (*cpu_match)(struct perf_s *p, const char *family_model);
 };
 
-#define PMU_FORMAT_NAME_SZ 128
-
 struct pmu_format_s {
 	struct rbn rbn; /* in pmu_s.format_rbt */
 	char   name[PMU_FORMAT_NAME_SZ];
@@ -237,7 +244,6 @@ struct pmu_event_s {
 	double scale; /* 0.0 means no scale */
 	struct perf_event_attr attr;
 	char   name[PMU_EVENT_NAME_SZ];
-	char   unit[PMU_EVENT_NAME_SZ];
 	char   event_value[PMU_EVENT_VALUE_SZ]; /* for debugging */
 	int    n_terms;
 	struct pmu_s *pmu; /* for convenient; built-ins (e.g. hw and cache) may not have PMU struct */
@@ -248,18 +254,17 @@ struct pmu_event_s {
 struct pmu_event_idx_s {
 	struct rbn rbn;
 	struct pmu_event_s *pmu_event;
-	int name_len; /* strlen(name) */
 	char name[];
 };
 
 /* contain pmu info */
 struct pmu_s {
 	struct rbn rbn; /* in perf_s.pmu_rbt */
-	char   name[256];
+	char   name[PMU_NAME_SZ];
 	struct rbt format_rbt; /* "event_source/devices/<PMU>/format/"*/
 	struct rbt events_rbt; /* "event_source/devices/<PMU>/events/"*/
 	uint32_t type;
-	uint8_t cpu_mask[1024]; /* should be enough ... */
+	uint8_t cpu_mask[MAX_CPU];
 };
 
 static const char *usage(ldmsd_plug_handle_t handle)
@@ -276,6 +281,8 @@ static int perf_event_open(struct perf_event_attr *attr,
 
 static void perf_close(struct perf_s *p);
 static struct pmu_s *pmu_find(struct perf_s *p, const char *name);
+static int parse_pe_event_name(const char *name, char *pmu_name, size_t pmu_sz,
+			       char *event_name, size_t event_sz);
 
 static int rbt_str_cmp(void *tree_key, const void *key)
 {
@@ -290,30 +297,24 @@ static inline struct rbn * RBT_DEL(struct rbt *rbt, struct rbn *rbn)
 }
 #define RBT_FOREACH_DEL(rbn, rbt) for ((rbn) = rbt_min(rbt); RBT_DEL(rbt, rbn) ; (rbn) = rbt_min(rbt))
 
-void pmu_free(struct pmu_s *pmu);
+static void pmu_free(struct pmu_s *pmu);
 static const char *json_value_find_cstr(struct perf_s *p, json_entity_t e,
 					const char *attr_name);
 
-static const bool is_sep[] = {
-	['\n'] = 1,
-	[' '] = 1,
-	[','] = 1,
-	[255] = 0,
-};
+static int is_list_sep(int c)
+{
+	return isspace((unsigned char)c) || c == ',';
+}
 
-static const bool is_digit[] = {
-	['0'] = 1,
-	['1'] = 1,
-	['2'] = 1,
-	['3'] = 1,
-	['4'] = 1,
-	['5'] = 1,
-	['6'] = 1,
-	['7'] = 1,
-	['8'] = 1,
-	['9'] = 1,
-	[255] = 0,
-};
+static int version_prefix_match(const char *prefix, const char *version)
+{
+	size_t n = strlen(prefix);
+
+	if (strlen(version) < n)
+		return 0;
+	return 0 == strncmp(prefix, version, n) &&
+	       !isdigit((unsigned char)version[n]);
+}
 
 static void perf_config_data_free(struct perf_s *p)
 {
@@ -522,7 +523,7 @@ static int xread_long(struct perf_s *p, const char *path, long *out)
 {
 	/* returns 0 on success, errno on error */
 
-	char buf[256]; /* plenty for a number */
+	char buf[NUMBER_BUF_SZ];
 	int len;
 
 	if (!out)
@@ -550,7 +551,7 @@ static int xread_double(struct perf_s *p, const char *path, double *out)
 {
 	/* returns 0 on success, errno on error */
 
-	char buf[256]; /* plenty for a number */
+	char buf[NUMBER_BUF_SZ];
 	int len;
 
 	if (!out)
@@ -601,7 +602,7 @@ static int load_perfdb(struct perf_s *p, const char *perfdb)
 {
 	struct utsname u;
 	const char *src_ver;
-	int rc, len;
+	int rc;
 
 	if (p->perfdb)
 		return EEXIST;
@@ -624,8 +625,7 @@ static int load_perfdb(struct perf_s *p, const char *perfdb)
 		goto out;
 	}
 
-	len = strlen(src_ver);
-	if (0 != strncmp(src_ver, u.release, len) || is_digit[(uint8_t)u.release[len]]) {
+	if (!version_prefix_match(src_ver, u.release)) {
 		_WARN(p, "perfdb is generated from Linux version '%s'"
 			 " while the running kernel version is '%s'\n",
 			 src_ver, u.release);
@@ -649,7 +649,7 @@ struct ranges_s {
 	int64_t curr_num;
 };
 
-void ranges_free(struct ranges_s *rs)
+static void ranges_free(struct ranges_s *rs)
 {
 	struct range_s *r;
 	if (!rs)
@@ -661,7 +661,7 @@ void ranges_free(struct ranges_s *rs)
 	free(rs);
 }
 
-struct ranges_s *ranges_new(struct perf_s *p, const char *str)
+static struct ranges_s *ranges_new(struct perf_s *p, const char *str)
 {
 	/* str example: "10-15,20,25-30" */
 
@@ -678,7 +678,7 @@ struct ranges_s *ranges_new(struct perf_s *p, const char *str)
 	rs->curr_range = NULL;
 
 	while (*s) {
-		if (is_sep[(unsigned char)*s]) {
+		if (is_list_sep(*s)) {
 			s += 1;
 			continue;
 		}
@@ -705,7 +705,7 @@ struct ranges_s *ranges_new(struct perf_s *p, const char *str)
 	return NULL;
 }
 
-int ranges_first(struct ranges_s *rs, int64_t *ret)
+static int ranges_first(struct ranges_s *rs, int64_t *ret)
 {
 	rs->curr_range = TAILQ_FIRST(&rs->ranges);
 	if (!rs->curr_range)
@@ -716,12 +716,7 @@ int ranges_first(struct ranges_s *rs, int64_t *ret)
 	return 0;
 }
 
-void ranges_curr(struct ranges_s *rs, int64_t *ret)
-{
-	*ret = rs->curr_num;
-}
-
-int ranges_next(struct ranges_s *rs, int64_t *ret)
+static int ranges_next(struct ranges_s *rs, int64_t *ret)
 {
 	if (!rs->curr_range)
 		return ranges_first(rs, ret);
@@ -848,7 +843,7 @@ static int cpu_mask_from_json(struct perf_s *p, json_entity_t parent,
 {
 	json_entity_t e;
 	enum json_value_e t;
-	char buf[64];
+	char buf[SMALL_BUF_SZ];
 
 	e = json_value_find(parent, attr);
 	if (!e)
@@ -867,7 +862,7 @@ static int cpu_mask_from_json(struct perf_s *p, json_entity_t parent,
 static int read_sysfs_int_optional(struct perf_s *p, const char *path, int dflt)
 {
 	int fd;
-	char buf[64];
+	char buf[SMALL_BUF_SZ];
 	ssize_t sz;
 	long out;
 
@@ -908,7 +903,7 @@ static int cpu_node_id(struct perf_s *p, int cpu)
 	DIR *d;
 	struct dirent *dent;
 	char path[PATH_MAX];
-	char buf[4096];
+	char buf[SYSFS_BUF_SZ];
 	struct ranges_s *rs;
 	int64_t v;
 	int rc, node_id = -1;
@@ -949,8 +944,8 @@ static int cpu_cache_info(struct perf_s *p, int cpu, int level, int *cache_id,
 	struct dirent *dent;
 	char dir[PATH_MAX];
 	char path[PATH_MAX];
-	char type[64];
-	char shared[4096];
+	char type[SMALL_BUF_SZ];
+	char shared[SYSFS_BUF_SZ];
 	int lvl;
 	int rc = ENOENT;
 
@@ -1260,14 +1255,13 @@ static int pmu_event_index(struct perf_s *p, struct pmu_event_s *pmu_event, cons
 		return ENOMEM;
 	}
 	memcpy(idx->name, key, len+1);
-	idx->name_len = len;
 	idx->pmu_event = pmu_event;
 	rbn_init(&idx->rbn, idx->name);
 	rbt_ins(&p->pmu_event_idx_rbt, &idx->rbn);
 	return 0;
 }
 
-void pmu_free(struct pmu_s *pmu)
+static void pmu_free(struct pmu_s *pmu)
 {
 	struct rbn *rbn;
 	struct pmu_event_s *pmu_event;
@@ -1317,7 +1311,7 @@ static int pmu_format_parse(struct perf_s *p, struct pmu_format_s *pmu_format,
 	if (!rs)
 		return errno;
 	while ((0 == ranges_next(rs, &num))) {
-		if (num < 0 || num >= 64) {
+		if (num < 0 || num >= PMU_FORMAT_BITS) {
 			ranges_free(rs);
 			_ERROR(p, "PMU format bit %" PRId64 " is outside [0-63].\n", num);
 			return EINVAL;
@@ -1395,7 +1389,7 @@ static struct pmu_s * pmu_find(struct perf_s *p, const char *name)
 	int rc;
 	long num;
 	char path[PATH_MAX];
-	char buf[4096];
+	char buf[SYSFS_BUF_SZ];
 	DIR *d = NULL;
 	struct dirent *dent;
 	struct pmu_format_s *pmu_format;
@@ -1564,60 +1558,6 @@ static inline void pmu_format_value_set(uint64_t format_bits, unsigned long long
 	}
 }
 
-/* ****************************** */
-/* excerpt from linux/tools/perf/ */
-/* ****************************** */
-
-struct event_symbol {
-	const char *symbol;
-	const char *alias;
-};
-
-const struct event_symbol event_symbols_hw[PERF_COUNT_HW_MAX] = {
-	[PERF_COUNT_HW_CPU_CYCLES] = {
-		.symbol = "cpu-cycles",
-		.alias  = "cycles",
-	},
-	[PERF_COUNT_HW_INSTRUCTIONS] = {
-		.symbol = "instructions",
-		.alias  = "",
-	},
-	[PERF_COUNT_HW_CACHE_REFERENCES] = {
-		.symbol = "cache-references",
-		.alias  = "",
-	},
-	[PERF_COUNT_HW_CACHE_MISSES] = {
-		.symbol = "cache-misses",
-		.alias  = "",
-	},
-	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS] = {
-		.symbol = "branch-instructions",
-		.alias  = "branches",
-	},
-	[PERF_COUNT_HW_BRANCH_MISSES] = {
-		.symbol = "branch-misses",
-		.alias  = "",
-	},
-	[PERF_COUNT_HW_BUS_CYCLES] = {
-		.symbol = "bus-cycles",
-		.alias  = "",
-	},
-	[PERF_COUNT_HW_STALLED_CYCLES_FRONTEND] = {
-		.symbol = "stalled-cycles-frontend",
-		.alias  = "idle-cycles-frontend",
-	},
-	[PERF_COUNT_HW_STALLED_CYCLES_BACKEND] = {
-		.symbol = "stalled-cycles-backend",
-		.alias  = "idle-cycles-backend",
-	},
-	[PERF_COUNT_HW_REF_CPU_CYCLES] = {
-		.symbol = "ref-cycles",
-		.alias  = "",
-	},
-};
-
-/* -------------------------------------------------------------------------- */
-
 static struct pmu_event_s *
 pmu_event_get(struct perf_s *p, struct pmu_s *pmu,
 	      const char *event_name, const char *event_value)
@@ -1627,7 +1567,7 @@ pmu_event_get(struct perf_s *p, struct pmu_s *pmu,
 	struct pmu_format_s *pmu_format;
 	int i, n, len, off, rc;
 	const char *s;
-	char term_name[256];
+	char term_name[PMU_FORMAT_NAME_SZ];
 	char path[PATH_MAX];
 	int64_t term_value;
 	unsigned long long *u;
@@ -1679,12 +1619,13 @@ pmu_event_get(struct perf_s *p, struct pmu_s *pmu,
 	i = 0;
 	s = event_value;
 	while (*s) {
-		if (is_sep[(unsigned char)*s]) {
+		if (is_list_sep(*s)) {
 			s++;
 			continue;
 		}
 		off = 0;
-		sscanf(s, "%255[^=]=%lx%n", term_name, &term_value, &off);
+		sscanf(s, "%" SCAN_STR(PMU_FORMAT_SCAN_MAX) "[^=]=%lx%n",
+		       term_name, &term_value, &off);
 		if (!off) {
 			_ERROR(p, "Event '%s/%s/' has bad term value: %s\n", pmu->name, event_name, s);
 			goto err;
@@ -1779,20 +1720,7 @@ struct perf_hw_event_s {
 	struct perf_event_attr attr;
 };
 
-#if 0
-	PERF_COUNT_HW_CPU_CYCLES		= 0,
-	PERF_COUNT_HW_INSTRUCTIONS		= 1,
-	PERF_COUNT_HW_CACHE_REFERENCES		= 2,
-	PERF_COUNT_HW_CACHE_MISSES		= 3,
-	PERF_COUNT_HW_BRANCH_INSTRUCTIONS	= 4,
-	PERF_COUNT_HW_BRANCH_MISSES		= 5,
-	PERF_COUNT_HW_BUS_CYCLES		= 6,
-	PERF_COUNT_HW_STALLED_CYCLES_FRONTEND	= 7,
-	PERF_COUNT_HW_STALLED_CYCLES_BACKEND	= 8,
-	PERF_COUNT_HW_REF_CPU_CYCLES		= 9,
-#endif
-
-struct perf_hw_event_s hw_events[] = {
+static const struct perf_hw_event_s hw_events[] = {
 	{"cpu-cycles", { .type = PERF_TYPE_HARDWARE, .config = PERF_COUNT_HW_CPU_CYCLES }},
 	{"cycles", { .type = PERF_TYPE_HARDWARE, .config = PERF_COUNT_HW_CPU_CYCLES }},
 
@@ -1822,11 +1750,11 @@ struct perf_hw_event_s hw_events[] = {
 static int load_perf_hw_events(struct perf_s *p)
 {
 	/* load events with attr.type == PERF_TYPE_HARDWARE into our event index */
-	struct perf_hw_event_s *h;
+	const struct perf_hw_event_s *h;
 	struct pmu_event_s *pmu_event;
 	int rc;
 
-	char buf[512];
+	char buf[PMU_EVENT_VALUE_SZ];
 
 	for (h = &hw_events[0]; h->name; h++) {
 		pmu_event = calloc(1, sizeof(*pmu_event));
@@ -1854,73 +1782,73 @@ static int load_perf_hw_events(struct perf_s *p)
 	return 0;
 }
 
-/* --- from linux/tools/perf/util/evsel.c ----------------------------------- */
-/*     (with some modification) */
-#define EVSEL__MAX_ALIASES 8
-const char *const evsel__hw_cache[PERF_COUNT_HW_CACHE_MAX][EVSEL__MAX_ALIASES] = {
- { "L1-dcache",	"l1-d",		"l1d",		"L1-data",		},
- { "L1-icache",	"l1-i",		"l1i",		"L1-instruction",	},
- { "LLC",	"L2",							},
- { "dTLB",	"d-tlb",	"Data-TLB",				},
- { "iTLB",	"i-tlb",	"Instruction-TLB",			},
- { "branch",	"branches",	"bpu",		"btb",		"bpc",	},
- { "node",								},
-};
-
-const char *const evsel__hw_cache_op[PERF_COUNT_HW_CACHE_OP_MAX][EVSEL__MAX_ALIASES] = {
- { "load",	"loads",	"read",					},
- { "store",	"stores",	"write",				},
- { "prefetch",	"prefetches",	"speculative-read", "speculative-load",	},
-};
-
-const char *const evsel__hw_cache_result[PERF_COUNT_HW_CACHE_RESULT_MAX][EVSEL__MAX_ALIASES] = {
- { "refs",	"Reference",	"ops",		"access",		},
- { "misses",	"miss",							},
-};
-
-#define C(x)		PERF_COUNT_HW_CACHE_##x
-#define CACHE_READ	(1 << C(OP_READ))
-#define CACHE_WRITE	(1 << C(OP_WRITE))
-#define CACHE_PREFETCH	(1 << C(OP_PREFETCH))
-#define COP(x)		(1 << x)
-
 /*
- * cache operation stat
- * L1I : Read and prefetch only
- * ITLB and BPU : Read-only
+ * Linux's perf_event_open API exposes cache events by numeric
+ * type/op/result IDs. These tables provide the small set of perf-style names
+ * and aliases this sampler accepts for those built-in cache events.
  */
-static const unsigned long evsel__hw_cache_stat[C(MAX)] = {
- [C(L1D)]	= (CACHE_READ | CACHE_WRITE | CACHE_PREFETCH),
- [C(L1I)]	= (CACHE_READ | CACHE_PREFETCH),
- [C(LL)]	= (CACHE_READ | CACHE_WRITE | CACHE_PREFETCH),
- [C(DTLB)]	= (CACHE_READ | CACHE_WRITE | CACHE_PREFETCH),
- [C(ITLB)]	= (CACHE_READ),
- [C(BPU)]	= (CACHE_READ),
- [C(NODE)]	= (CACHE_READ | CACHE_WRITE | CACHE_PREFETCH),
+#define CACHE_MAX_ALIASES 8
+#define CACHE_TYPE(_x)	 PERF_COUNT_HW_CACHE_##_x
+#define CACHE_OP(_x)	 PERF_COUNT_HW_CACHE_OP_##_x
+#define CACHE_OP_BIT(_x) (1 << CACHE_OP(_x))
+
+static const char *const cache_type_aliases[PERF_COUNT_HW_CACHE_MAX][CACHE_MAX_ALIASES] = {
+	[CACHE_TYPE(L1D)] = { "L1-dcache", "l1-d", "l1d", "L1-data" },
+	[CACHE_TYPE(L1I)] = { "L1-icache", "l1-i", "l1i", "L1-instruction" },
+	[CACHE_TYPE(LL)] = { "LLC", "L2" },
+	[CACHE_TYPE(DTLB)] = { "dTLB", "d-tlb", "Data-TLB" },
+	[CACHE_TYPE(ITLB)] = { "iTLB", "i-tlb", "Instruction-TLB" },
+	[CACHE_TYPE(BPU)] = { "branch", "branches", "bpu", "btb", "bpc" },
+	[CACHE_TYPE(NODE)] = { "node" },
 };
 
-static int __is_cache_op_valid(int type, int op)
+static const char *const cache_op_aliases[PERF_COUNT_HW_CACHE_OP_MAX][CACHE_MAX_ALIASES] = {
+	[CACHE_OP(READ)] = { "load", "loads", "read" },
+	[CACHE_OP(WRITE)] = { "store", "stores", "write" },
+	[CACHE_OP(PREFETCH)] = { "prefetch", "prefetches",
+				 "speculative-read", "speculative-load" },
+};
+
+static const char *const cache_result_aliases[PERF_COUNT_HW_CACHE_RESULT_MAX][CACHE_MAX_ALIASES] = {
+	[PERF_COUNT_HW_CACHE_RESULT_ACCESS] = { "refs", "Reference", "ops", "access" },
+	[PERF_COUNT_HW_CACHE_RESULT_MISS] = { "misses", "miss" },
+};
+
+static const unsigned long cache_valid_ops[PERF_COUNT_HW_CACHE_MAX] = {
+	[CACHE_TYPE(L1D)] = CACHE_OP_BIT(READ) | CACHE_OP_BIT(WRITE) |
+			    CACHE_OP_BIT(PREFETCH),
+	[CACHE_TYPE(L1I)] = CACHE_OP_BIT(READ) | CACHE_OP_BIT(PREFETCH),
+	[CACHE_TYPE(LL)] = CACHE_OP_BIT(READ) | CACHE_OP_BIT(WRITE) |
+			   CACHE_OP_BIT(PREFETCH),
+	[CACHE_TYPE(DTLB)] = CACHE_OP_BIT(READ) | CACHE_OP_BIT(WRITE) |
+			     CACHE_OP_BIT(PREFETCH),
+	[CACHE_TYPE(ITLB)] = CACHE_OP_BIT(READ),
+	[CACHE_TYPE(BPU)] = CACHE_OP_BIT(READ),
+	[CACHE_TYPE(NODE)] = CACHE_OP_BIT(READ) | CACHE_OP_BIT(WRITE) |
+			     CACHE_OP_BIT(PREFETCH),
+};
+
+static int cache_op_is_valid(int cache_type, int op)
 {
-	if (evsel__hw_cache_stat[type] & COP(op))
-		return true;	/* valid */
-	else
-		return false;	/* invalid */
+	return !!(cache_valid_ops[cache_type] & (1 << op));
 }
 
-int __hw_cache_type_op_res_name(int type, int op, int result, char *bf, size_t size)
+static int cache_event_name(int cache_type, int op, int result,
+			    char *buf, size_t bufsz)
 {
+	const char *op_name = result ? cache_op_aliases[op][0] :
+				       cache_op_aliases[op][1];
+
 	if (result) {
-		return snprintf(bf, size, "%s-%s-%s", evsel__hw_cache[type][0],
-				 evsel__hw_cache_op[op][0],
-				 evsel__hw_cache_result[result][0]);
+		return snprintf(buf, bufsz, "%s-%s-%s",
+				cache_type_aliases[cache_type][0],
+				op_name, cache_result_aliases[result][0]);
 	}
-
-	return snprintf(bf, size, "%s-%s", evsel__hw_cache[type][0],
-			 evsel__hw_cache_op[op][1]);
+	return snprintf(buf, bufsz, "%s-%s",
+			cache_type_aliases[cache_type][0], op_name);
 }
-/* -------------------------------------------------------------------------- */
 
-static int __is_event_supported(int type, int64_t config)
+static int perf_event_is_supported(int type, int64_t config)
 {
 	struct perf_event_attr attr = {
 			.type = type,
@@ -1951,116 +1879,85 @@ static int __is_event_supported(int type, int64_t config)
 	return 1; /* supported */
 }
 
-struct cache_alias_s {
-	int type;
-	int op;
-	int res;
-	const char *const *type_a;
-	const char *const *op_a;
-	const char *const *res_a;
-	int type_i;
-	int op_i;
-	int res_i;
-};
-
-void cache_alias_init(struct cache_alias_s *itr, int type, int op, int res)
+static int cache_alias_index_one(struct perf_s *p, struct pmu_event_s *pmu_event,
+				 const char *alias)
 {
-	itr->type = type;
-	itr->op = op;
-	itr->res = res;
-	itr->type_a = evsel__hw_cache[type];
-	itr->op_a = evsel__hw_cache_op[op];
-	itr->res_a = evsel__hw_cache_result[res];
-	itr->type_i = 0;
-	itr->op_i = 0;
-	itr->res_i = 0;
+	char buf[PMU_EVENT_VALUE_SZ];
+	int n, rc;
+
+	rc = pmu_event_index(p, pmu_event, alias);
+	if (rc)
+		return rc;
+
+	n = snprintf(buf, sizeof(buf), "cpu/%s/", alias);
+	if (n < 0 || (size_t)n >= sizeof(buf))
+		return ENAMETOOLONG;
+	return pmu_event_index(p, pmu_event, buf);
 }
 
-int cache_alias_first(struct cache_alias_s *itr, char *buf, size_t bufsz)
+static int cache_alias_index_all(struct perf_s *p, struct pmu_event_s *pmu_event,
+				 int cache_type, int op, int result)
 {
-	int len;
+	const char *const *type_alias;
+	const char *const *op_alias;
+	const char *const *result_alias;
+	char alias[PMU_EVENT_NAME_SZ];
+	int n, rc;
 
-	itr->type_i = 0;
-	itr->op_i = 0;
-	itr->res_i = 0;
-
-	len = (itr->res)?
-		snprintf(buf, bufsz, "%s-%s-%s",
-				evsel__hw_cache[itr->type][itr->type_i],
-				evsel__hw_cache_op[itr->op][itr->op_i],
-				evsel__hw_cache_result[itr->res][itr->res_i]):
-		snprintf(buf, bufsz, "%s-%s",
-				evsel__hw_cache[itr->type][itr->type_i],
-				evsel__hw_cache_op[itr->op][itr->op_i]);
-
-	return len;
-}
-
-int cache_alias_next(struct cache_alias_s *itr, char *buf, size_t bufsz)
-{
-	int len;
-
-	if (itr->res) {
-		if (!itr->res_a[++itr->res_i])
-			itr->res_i = 0; /* wrap */
-	}
-
-	if (0 == itr->res_i) {
-		if (!itr->op_a[++itr->op_i])
-			itr->op_i = 0;
-	}
-
-	if (0 == itr->op_i) {
-		if (!itr->type_a[++itr->type_i]) {
-			itr->type_i = 0;
-			/* end of iteration */
-			return -ENOENT;
+	for (type_alias = cache_type_aliases[cache_type]; *type_alias; type_alias++) {
+		for (op_alias = cache_op_aliases[op]; *op_alias; op_alias++) {
+			if (!result) {
+				n = snprintf(alias, sizeof(alias), "%s-%s",
+					     *type_alias, *op_alias);
+				if (n < 0 || (size_t)n >= sizeof(alias))
+					return ENAMETOOLONG;
+				rc = cache_alias_index_one(p, pmu_event, alias);
+				if (rc)
+					return rc;
+				continue;
+			}
+			for (result_alias = cache_result_aliases[result];
+			     *result_alias; result_alias++) {
+				n = snprintf(alias, sizeof(alias), "%s-%s-%s",
+					     *type_alias, *op_alias, *result_alias);
+				if (n < 0 || (size_t)n >= sizeof(alias))
+					return ENAMETOOLONG;
+				rc = cache_alias_index_one(p, pmu_event, alias);
+				if (rc)
+					return rc;
+			}
 		}
 	}
-
-	len = (itr->res)?
-		snprintf(buf, bufsz, "%s-%s-%s",
-				evsel__hw_cache[itr->type][itr->type_i],
-				evsel__hw_cache_op[itr->op][itr->op_i],
-				evsel__hw_cache_result[itr->res][itr->res_i]):
-		snprintf(buf, bufsz, "%s-%s",
-				evsel__hw_cache[itr->type][itr->type_i],
-				evsel__hw_cache_op[itr->op][itr->op_i]);
-
-	return len;
+	return 0;
 }
 
 static int load_perf_cache_events(struct perf_s *p)
 {
 	/*
-	 * Populate cache events using logic influenced by
-	 * "linux/tools/perf/util/print-events.c:print_hwcache_event()".
+	 * Register kernel PERF_TYPE_HW_CACHE combinations that this host can
+	 * open, plus the perf-style aliases users normally type.
 	 */
-
-	/* load events with attr.type == PERF_TYPE_HW_CACHE into our event index */
 
 	int ctype, op, res, len, rc;
 	int64_t config;
 	struct pmu_event_s *pmu_event;
-	struct cache_alias_s itr;
-	char buf[512];
 
 	for (ctype = 0; ctype < PERF_COUNT_HW_CACHE_MAX; ctype++) {
 		for (op = 0; op < PERF_COUNT_HW_CACHE_OP_MAX; op++) {
-			if (!__is_cache_op_valid(ctype, op))
+			if (!cache_op_is_valid(ctype, op))
 				continue;
 			for (res = 0; res < PERF_COUNT_HW_CACHE_RESULT_MAX; res++) {
 				config = (ctype) | (op << 8) | (res << 16) ;
-				if (!__is_event_supported(PERF_TYPE_HW_CACHE, config))
+				if (!perf_event_is_supported(PERF_TYPE_HW_CACHE, config))
 					continue;
 				pmu_event = calloc(1, sizeof(*pmu_event));
 				if (unlikely(!pmu_event)) {
 					_ERROR(p, "Not enough memory\n");
 					return ENOMEM;
 				}
-				len = __hw_cache_type_op_res_name(ctype, op, res,
-						pmu_event->name,
-						sizeof(pmu_event->name));
+				len = cache_event_name(ctype, op, res,
+						       pmu_event->name,
+						       sizeof(pmu_event->name));
 				if (unlikely((size_t)len >= sizeof(pmu_event->name))) {
 					_ERROR(p, "cache name too long\n");
 					free(pmu_event);
@@ -2073,22 +1970,9 @@ static int load_perf_cache_events(struct perf_s *p)
 				rbn_init(&pmu_event->rbn, pmu_event->name);
 				rbt_ins(&p->builtin_events_rbt, &pmu_event->rbn);
 
-				cache_alias_init(&itr, ctype, op, res);
-				snprintf(buf, 5, "cpu/");
-
-				for (len = cache_alias_first(&itr, buf+4, sizeof(buf)-4);
-				     len > 0;
-				     len = cache_alias_next(&itr, buf+4, sizeof(buf)-4)) {
-					/* "<NAME>" */
-					rc = pmu_event_index(p, pmu_event, buf + 4);
-					if (rc)
-						return rc;
-					/* "cpu/<NAME>/" */
-					snprintf(buf+4+len, 2, "/");
-					rc = pmu_event_index(p, pmu_event, buf);
-					if (rc)
-						return rc;
-				}
+				rc = cache_alias_index_all(p, pmu_event, ctype, op, res);
+				if (rc)
+					return rc;
 			}
 		}
 	}
@@ -2105,11 +1989,11 @@ static struct pmu_event_s *event_lookup(struct perf_s *p, const char *name)
 	json_entity_t e_model_event;
 	const char *c_pmu, *c_event, *c_name;
 
-	int n, off;
+	int n;
 	int is_pe_form = 0; /* name is "/<PMU>/<EVENT>/" format */
 	char path[PATH_MAX];
-	char pmu_name[256], event_name[256];
-	char event_value[512]; /* e.g. "event=0x29,umask=7" */
+	char pmu_name[PMU_NAME_SZ], event_name[PMU_EVENT_NAME_SZ];
+	char event_value[PMU_EVENT_VALUE_SZ]; /* e.g. "event=0x29,umask=7" */
 
 
 	/* If the event has already been looked up, return it. */
@@ -2120,9 +2004,8 @@ static struct pmu_event_s *event_lookup(struct perf_s *p, const char *name)
 		goto out;
 	}
 
-	off = 0;
-	sscanf(name, "%255[^/]/%255[^/]/%n", pmu_name, event_name, &off);
-	if ((size_t)off == strlen(name)) {
+	if (parse_pe_event_name(name, pmu_name, sizeof(pmu_name),
+				event_name, sizeof(event_name))) {
 		is_pe_form = 1;
 	}
 
@@ -2246,14 +2129,16 @@ counter_new(struct perf_s *p, struct pmu_event_s *pmu_event, int cpu, int pid,
 	return c;
 }
 
-static int event_is_pe_form(const char *name, char *pmu_name, size_t pmu_sz,
-			    char *event_name, size_t event_sz)
+static int parse_pe_event_name(const char *name, char *pmu_name, size_t pmu_sz,
+			       char *event_name, size_t event_sz)
 {
 	int off = 0;
-	char pmu[256] = "";
-	char event[256] = "";
+	char pmu[PMU_NAME_SZ] = "";
+	char event[PMU_EVENT_NAME_SZ] = "";
 
-	sscanf(name, "%255[^/]/%255[^/]/%n", pmu, event, &off);
+	sscanf(name, "%" SCAN_STR(PMU_EVENT_SCAN_MAX) "[^/]/"
+		     "%" SCAN_STR(PMU_EVENT_SCAN_MAX) "[^/]/%n",
+	       pmu, event, &off);
 	if (!off || (size_t)off != strlen(name))
 		return 0;
 	snprintf(pmu_name, pmu_sz, "%s", pmu);
@@ -2264,16 +2149,16 @@ static int event_is_pe_form(const char *name, char *pmu_name, size_t pmu_sz,
 static struct pmu_event_s *
 event_lookup_for_instance(struct perf_s *p, const char *name, struct instance_s *inst)
 {
-	char pmu_name[256];
-	char event_name[256];
-	char full_name[512];
+	char pmu_name[PMU_NAME_SZ];
+	char event_name[PMU_EVENT_NAME_SZ];
+	char full_name[PMU_EVENT_VALUE_SZ];
 	int n;
 
 	if (p->template_type != TEMPLATE_PMU)
 		return event_lookup(p, name);
 
-	if (event_is_pe_form(name, pmu_name, sizeof(pmu_name),
-			     event_name, sizeof(event_name))) {
+	if (parse_pe_event_name(name, pmu_name, sizeof(pmu_name),
+				event_name, sizeof(event_name))) {
 		if (0 != strcmp(pmu_name, inst->pmu)) {
 			errno = EINVAL;
 			_ERROR(p, "Event '%s' targets PMU '%s', not template instance '%s'.\n",
@@ -2522,9 +2407,9 @@ static int make_set(struct perf_s *p)
 	};
 	struct ldms_metric_template_s insttmp[] = {
 		{ "index", 0, LDMS_V_U32, NULL, 1, NULL },
-		{ "instance_type", 0, LDMS_V_CHAR_ARRAY, NULL, 32, NULL },
-		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
-		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
+		{ "instance_type", 0, LDMS_V_CHAR_ARRAY, NULL, INSTANCE_TYPE_SZ, NULL },
+		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
+		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
 		{ "representative_cpu", 0, LDMS_V_S32, NULL, 1, NULL },
 		{ "socket_id", 0, LDMS_V_S32, NULL, 1, NULL },
 		{ "die_id", 0, LDMS_V_S32, NULL, 1, NULL },
@@ -2534,17 +2419,17 @@ static int make_set(struct perf_s *p)
 		{0}
 	};
 	struct ldms_metric_template_s rectmp[] = {
-		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
+		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
 		{ "event_spec", 0, LDMS_V_CHAR_ARRAY, NULL, PMU_EVENT_VALUE_SZ, NULL },
-		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
+		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
 		{ "pid", 0, LDMS_V_S64, NULL, 1, NULL },
 		{ "values", 0, LDMS_V_S64_ARRAY, NULL, p->instance_count, NULL },
 		{0}
 	};
 	struct ldms_metric_template_s srectmp[] = {
-		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
+		{ "name", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
 		{ "event_spec", 0, LDMS_V_CHAR_ARRAY, NULL, PMU_EVENT_VALUE_SZ, NULL },
-		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, 128, NULL },
+		{ "pmu", 0, LDMS_V_CHAR_ARRAY, NULL, LDMS_NAME_SZ, NULL },
 		{ "pid", 0, LDMS_V_S64, NULL, 1, NULL },
 		{ "values", 0, LDMS_V_D64_ARRAY, NULL, p->instance_count, NULL },
 		{0}
@@ -2646,12 +2531,13 @@ static int make_set(struct perf_s *p)
 		}
 		ldms_list_append_record(p->set, p->instances_mval, rec_mval);
 		ldms_record_metric_get(rec_mval, INST_INDEX)->v_u32 = inst->index;
-		snprintf(ldms_record_metric_get(rec_mval, INST_TYPE)->a_char, 32, "%s",
+		snprintf(ldms_record_metric_get(rec_mval, INST_TYPE)->a_char,
+			 INSTANCE_TYPE_SZ, "%s",
 			 template_type_name(inst->type));
-		snprintf(ldms_record_metric_get(rec_mval, INST_NAME)->a_char, 128, "%s",
-			 inst->name);
-		snprintf(ldms_record_metric_get(rec_mval, INST_PMU)->a_char, 128, "%s",
-			 inst->pmu);
+		snprintf(ldms_record_metric_get(rec_mval, INST_NAME)->a_char,
+			 LDMS_NAME_SZ, "%s", inst->name);
+		snprintf(ldms_record_metric_get(rec_mval, INST_PMU)->a_char,
+			 LDMS_NAME_SZ, "%s", inst->pmu);
 		ldms_record_metric_get(rec_mval, INST_CPU)->v_s32 = inst->representative_cpu;
 		ldms_record_metric_get(rec_mval, INST_SOCKET)->v_s32 = inst->socket_id;
 		ldms_record_metric_get(rec_mval, INST_DIE)->v_s32 = inst->die_id;
@@ -2680,12 +2566,12 @@ static int make_set(struct perf_s *p)
 		}
 		ldms_list_append_record(p->set, list_mval, rec_mval);
 		er->rec_mval = rec_mval;
-		snprintf(ldms_record_metric_get(rec_mval, EV_NAME)->a_char, 128, "%s",
-			 er->name);
+		snprintf(ldms_record_metric_get(rec_mval, EV_NAME)->a_char,
+			 LDMS_NAME_SZ, "%s", er->name);
 		snprintf(ldms_record_metric_get(rec_mval, EV_SPEC)->a_char,
 			 PMU_EVENT_VALUE_SZ, "%s", er->event_spec);
-		snprintf(ldms_record_metric_get(rec_mval, EV_PMU)->a_char, 128, "%s",
-			 er->pmu);
+		snprintf(ldms_record_metric_get(rec_mval, EV_PMU)->a_char,
+			 LDMS_NAME_SZ, "%s", er->pmu);
 		ldms_record_metric_get(rec_mval, EV_PID)->v_s64 = er->pid;
 		er->values_mval = ldms_record_metric_get(rec_mval, EV_VALUES);
 	}
@@ -3016,10 +2902,10 @@ int x86_proc_cpu_model(char *buf, size_t bufsz)
 {
 	FILE *f;
 	int cpu_id = -1;
-	char lbuf[256];
-	char vendor[256];
-	char family[64];
-	char model[64];
+	char lbuf[CPUINFO_LINE_SZ];
+	char vendor[CPUINFO_LINE_SZ];
+	char family[CPUINFO_FIELD_SZ];
+	char model[CPUINFO_FIELD_SZ];
 	int n;
 	int rc;
 
@@ -3075,7 +2961,7 @@ static int x86_set_cpu_model(struct perf_s *p)
 static int x86_cpu_match(struct perf_s *p, const char *family_model)
 {
 	regex_t regex;
-	char reg_str[1024];
+	char reg_str[MODEL_REGEX_SZ];
 	int rc;
 	int len;
 	len = snprintf(reg_str, sizeof(reg_str), "^%s$", family_model);
