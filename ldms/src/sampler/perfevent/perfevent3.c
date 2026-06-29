@@ -394,7 +394,6 @@ static void perf_free(struct perf_s *p)
 static void destructor(ldmsd_plug_handle_t handle)
 {
 	struct perf_s *p = ldmsd_plug_ctxt_get(handle);
-	perf_close(p);
 	perf_free(p);
 }
 
@@ -2268,6 +2267,7 @@ event_lookup_for_instance(struct perf_s *p, const char *name, struct instance_s 
 	char pmu_name[256];
 	char event_name[256];
 	char full_name[512];
+	int n;
 
 	if (p->template_type != TEMPLATE_PMU)
 		return event_lookup(p, name);
@@ -2283,7 +2283,13 @@ event_lookup_for_instance(struct perf_s *p, const char *name, struct instance_s 
 		return event_lookup(p, name);
 	}
 
-	snprintf(full_name, sizeof(full_name), "%s/%s/", inst->pmu, name);
+	n = snprintf(full_name, sizeof(full_name), "%s/%s/", inst->pmu, name);
+	if (n < 0 || (size_t)n >= sizeof(full_name)) {
+		errno = ENAMETOOLONG;
+		_ERROR(p, "Event '%s' is too long for PMU instance '%s'.\n",
+		       name, inst->pmu);
+		return NULL;
+	}
 	return event_lookup(p, full_name);
 }
 
@@ -2769,11 +2775,14 @@ static int get_n_cpu(struct perf_s *p)
 		_DEBUG(p, "Cannot get number of cpus from sysconf(), try /sys/bus/cpu/devices\n");
 		n_cpu = 0;
 		d = opendir("/sys/bus/cpu/devices");
+		if (!d)
+			return -1;
 		while ((dent = readdir(d))) {
-			if (0 == strncmp("cpu", dent->d_name, 3)) /* count only "cpu*" */
+			if (0 != strncmp("cpu", dent->d_name, 3)) /* count only "cpu*" */
 				continue;
 			n_cpu++;
 		}
+		closedir(d);
 	}
 	return n_cpu;
 }
@@ -2986,6 +2995,11 @@ static int sample(ldmsd_plug_handle_t handle)
 
 		if (len == 0) {
 			_ERROR(p, "sample(): read() EOF\n");
+			continue;
+		}
+		if (len != sizeof(raw)) {
+			_ERROR(p, "sample(): read() returned %d bytes, expected %zu\n",
+			       len, sizeof(raw));
 			continue;
 		}
 		if (c->pmu_event->scale) {
