@@ -2856,7 +2856,7 @@ static int config(ldmsd_plug_handle_t handle,
 	if (p->base) {
 		_ERROR(p, "already configured.\n");
 		rc = EBUSY;
-		goto err;
+		goto out;
 	}
 
 	if (!av_conf) {
