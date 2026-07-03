@@ -1749,7 +1749,7 @@ static int sample(ldmsd_plug_handle_t handle)
 
 	if (!p || !p->set)
 		return ENOENT;
-	ldms_transaction_begin(p->set);
+	base_sample_begin(p->base);
 	for (i = 0; i < p->binding_count; i++) {
 		b = &p->bindings[i];
 		n = read(b->fd, &rv, sizeof(rv));
@@ -1774,7 +1774,7 @@ static int sample(ldmsd_plug_handle_t handle)
 			p->event_metric_ids[PE_EVENT_TIME_RUNNING], inst_id,
 			rv.time_running);
 	}
-	ldms_transaction_end(p->set);
+	base_sample_end(p->base);
 	return 0;
 }
 
