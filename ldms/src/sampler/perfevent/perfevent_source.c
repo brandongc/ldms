@@ -1301,6 +1301,70 @@ static int event_name_duplicate(struct pe_sampler *p, const char *name)
 	return 0;
 }
 
+static int ldms_string_check(struct pe_sampler *p, const char *kind,
+			     const char *id, const char *field,
+			     const char *value, size_t metric_len)
+{
+	size_t len;
+
+	if (!value)
+		value = "";
+	len = strlen(value);
+	if (len < metric_len)
+		return 0;
+	_ERROR(p, "%s '%s' field '%s' length %zu exceeds LDMS limit %zu\n",
+	       kind, id ? id : "(unknown)", field, len,
+	       metric_len ? metric_len - 1 : 0);
+	return ENAMETOOLONG;
+}
+
+static int ldms_strings_validate(struct pe_sampler *p)
+{
+	size_t i;
+	int rc;
+
+	for (i = 0; i < p->instance_count; i++) {
+		rc = ldms_string_check(p, "instance", p->instances[i].name,
+				       "name", p->instances[i].name,
+				       PE_LDMS_NAME_LEN);
+		if (rc)
+			return rc;
+		rc = ldms_string_check(p, "instance", p->instances[i].name,
+				       "pmu", p->instances[i].pmu_name,
+				       PE_LDMS_NAME_LEN);
+		if (rc)
+			return rc;
+		rc = ldms_string_check(p, "instance", p->instances[i].name,
+				       "cpus", p->instances[i].cpus,
+				       PE_LDMS_CPUS_LEN);
+		if (rc)
+			return rc;
+		rc = ldms_string_check(p, "instance", p->instances[i].name,
+				       "labels", p->instances[i].labels,
+				       PE_LDMS_LABEL_LEN);
+		if (rc)
+			return rc;
+	}
+	for (i = 0; i < p->event_count; i++) {
+		rc = ldms_string_check(p, "event", p->events[i].name,
+				       "name", p->events[i].name,
+				       PE_LDMS_NAME_LEN);
+		if (rc)
+			return rc;
+		rc = ldms_string_check(p, "event", p->events[i].name,
+				       "pmu", p->events[i].pmu_name,
+				       PE_LDMS_NAME_LEN);
+		if (rc)
+			return rc;
+		rc = ldms_string_check(p, "event", p->events[i].name,
+				       "unit", p->events[i].unit,
+				       PE_LDMS_UNIT_LEN);
+		if (rc)
+			return rc;
+	}
+	return 0;
+}
+
 static int event_append_from_json(struct pe_sampler *p, json_entity_t e)
 {
 	static const char * const event_keys[] = { "name", "raw" };
@@ -1504,6 +1568,10 @@ static int make_set(struct pe_sampler *p)
 	size_t i, j;
 	int rc;
 	int in_txn = 0;
+
+	rc = ldms_strings_validate(p);
+	if (rc)
+		return rc;
 
 	schema = base_schema_new(p->base);
 	if (!schema)
