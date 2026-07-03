@@ -57,6 +57,7 @@
 #include <limits.h>
 #include <linux/limits.h>
 #include <linux/perf_event.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -366,6 +367,31 @@ static int parse_u64_text(const char *s, uint64_t *out)
 		end++;
 	if (*end)
 		return EINVAL;
+	*out = v;
+	return 0;
+}
+
+static int parse_double_text(const char *s, double *out)
+{
+	char *end;
+	double v;
+
+	while (isspace((unsigned char)*s))
+		s++;
+	if (!*s)
+		return EINVAL;
+	errno = 0;
+	v = strtod(s, &end);
+	if (end == s)
+		return EINVAL;
+	if (errno)
+		return errno;
+	while (isspace((unsigned char)*end))
+		end++;
+	if (*end)
+		return EINVAL;
+	if (!isfinite(v))
+		return ERANGE;
 	*out = v;
 	return 0;
 }
@@ -1071,12 +1097,14 @@ static int event_read_metadata(struct pe_sampler *p, struct pe_event *event)
 		return ENAMETOOLONG;
 	rc = read_sysfs_text(p, path, text, sizeof(text), 1);
 	if (!rc) {
-		errno = 0;
-		event->scale = strtod(text, NULL);
-		if (errno) {
+		double scale;
+
+		rc = parse_double_text(text, &scale);
+		if (rc) {
 			_ERROR(p, "bad scale in '%s': %s\n", path, text);
-			return errno;
+			return rc;
 		}
+		event->scale = scale;
 	} else if (rc != ENOENT) {
 		return rc;
 	}
