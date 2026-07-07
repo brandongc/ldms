@@ -1101,6 +1101,7 @@ ldms/src/sampler/ibnet/Makefile
 ldms/src/sampler/sysclassib/Makefile
 ldms/src/sampler/opa2/Makefile
 ldms/src/sampler/perfevent/Makefile
+ldms/src/sampler/linux_perf/Makefile
 ldms/src/sampler/procnet/Makefile
 ldms/src/sampler/procnfs/Makefile
 ldms/src/sampler/procnetdev/Makefile

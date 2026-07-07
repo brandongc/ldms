@@ -40,7 +40,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 /**
- * \file perfevent_source.c
+ * \file linux_perf.c
  * \brief Source-instance-first Linux perf event sampler.
  */
 
@@ -76,18 +76,27 @@
 #include "ldmsd_plug_api.h"
 #include "../sampler_base.h"
 
-#define SAMP "perfevent_source"
+#define SAMP "linux_perf"
 
 #define PE_SYSFS_PMU_ROOT "/sys/bus/event_source/devices"
 #define PE_SYSFS_CPU_ROOT "/sys/devices/system/cpu"
 
-/* LDMS string metrics include the terminating NUL byte. */
+/*
+ * LDMS char-array lengths include the terminating NUL byte. PMU and event
+ * names are sysfs path components, so NAME_MAX + 1 is the natural bound.
+ * Unit, CPU-list, and label fields have no Linux perf constants; keep the
+ * schema limits explicit and validate before populating the set.
+ */
 #define PE_LDMS_NAME_LEN   (NAME_MAX + 1)
 #define PE_LDMS_UNIT_LEN   64
 #define PE_LDMS_CPUS_LEN   256
 #define PE_LDMS_LABEL_LEN  512
 
+/* Sysfs event and format files are small text records; reject larger input. */
 #define PE_SYSFS_TEXT_LEN 4096
+#define PE_FORMAT_FIELD_BITS (sizeof(uint64_t) * CHAR_BIT)
+/* perf_event_attr exposes config, config1, config2, and config3 fields. */
+#define PE_PERF_CONFIG_WORD_MAX 3
 
 #define _LOG(p, lvl, fmt, ...) ovis_log((p)->log, lvl, fmt, ## __VA_ARGS__)
 #define _ERROR(p, fmt, ...) _LOG(p, OVIS_LERROR, fmt, ## __VA_ARGS__)
@@ -117,6 +126,7 @@ enum pe_event_metric {
 
 struct pe_format {
 	char *name;
+	/* perf sysfs format files map this field into attr.configN bits. */
 	int config;
 	uint64_t mask;
 };
@@ -134,6 +144,7 @@ struct pe_instance {
 	char *name;
 	char *pmu_name;
 	int instance_id;
+	/* CPU argument used for perf_event_open(); not a CPU-locality claim. */
 	int binding_cpu;
 	char *cpus;
 	char *labels;
@@ -551,7 +562,7 @@ static int parse_bit_range_list(struct pe_sampler *p, const char *str,
 		} else {
 			b = a;
 		}
-		if (b < a || b >= 64)
+		if (b < a || b >= PE_FORMAT_FIELD_BITS)
 			goto bad;
 		for (v = a; v <= b; v++)
 			*mask |= UINT64_C(1) << v;
@@ -716,6 +727,7 @@ static int pmu_format_parse(struct pe_sampler *p, struct pe_format *format,
 	uint64_t config = 0;
 	int rc;
 
+	/* Example sysfs text: "event=config:0-7,32-35,59-60". */
 	if (strncmp(s, "config", 6))
 		goto bad;
 	s += 6;
@@ -724,7 +736,7 @@ static int pmu_format_parse(struct pe_sampler *p, struct pe_format *format,
 		if (rc)
 			goto bad;
 	}
-	if (config > 3 || *s != ':')
+	if (config > PE_PERF_CONFIG_WORD_MAX || *s != ':')
 		goto bad;
 	s++;
 	rc = parse_bit_range_list(p, s, &format->mask);
@@ -903,6 +915,10 @@ static void attr_format_value_set(uint64_t mask, __u64 *field, uint64_t value)
 	uint64_t f;
 	uint64_t v;
 
+	/*
+	 * PMU format masks may be discontiguous. Pack consecutive value bits
+	 * into the mask-selected perf_event_attr bits in increasing order.
+	 */
 	for (f = 1, v = 1; f; f <<= 1) {
 		if (!(mask & f))
 			continue;
@@ -928,7 +944,7 @@ static int event_encode_term(struct pe_sampler *p, struct pe_event *event,
 		return ENOENT;
 	}
 	bits = mask_bit_count(fmt->mask);
-	if (bits < 64 && (value >> bits)) {
+	if (bits < PE_FORMAT_FIELD_BITS && (value >> bits)) {
 		_ERROR(p, "value 0x%" PRIx64 " is too wide for field '%s'\n",
 		       value, term);
 		return ERANGE;
@@ -965,6 +981,7 @@ static int event_init_attr(struct pe_sampler *p, struct pe_event *event)
 	event->attr.type = p->pmu.type;
 	event->attr.size = sizeof(event->attr);
 	event->attr.disabled = 1;
+	/* sample() reads struct pe_read_value in this exact order. */
 	event->attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
 				  PERF_FORMAT_TOTAL_TIME_RUNNING;
 	return 0;
@@ -1054,6 +1071,7 @@ static int event_encode_raw(struct pe_sampler *p, struct pe_event *event,
 	int count = 0;
 	int rc;
 
+	/* Raw JSON keys are PMU format field names, not perf CLI fragments. */
 	if (json_entity_type(raw) != JSON_DICT_VALUE) {
 		_ERROR(p, "event '%s' raw must be an object\n", event->name);
 		return EINVAL;
@@ -1511,6 +1529,7 @@ static int bindings_open(struct pe_sampler *p)
 	for (i = 0; i < p->binding_count; i++) {
 		b = &p->bindings[i];
 		attr = b->event->attr;
+		/* The PMU cpumask-selected binding CPU is the perf_event_open CPU. */
 		b->fd = perf_event_open(&attr, -1, b->instance->binding_cpu,
 					-1, 0);
 		if (b->fd < 0) {
@@ -1605,7 +1624,7 @@ static int make_set(struct pe_sampler *p)
 	if (!schema)
 		return errno;
 
-	inst_recdef = ldms_record_from_template("perfevent_source_instance",
+	inst_recdef = ldms_record_from_template("linux_perf_instance",
 						inst_tmp, p->inst_metric_ids);
 	if (!inst_recdef) {
 		rc = errno;
@@ -1619,7 +1638,7 @@ static int make_set(struct pe_sampler *p)
 	p->inst_recdef_mid = rc;
 	inst_recdef_added = 1;
 
-	event_recdef = ldms_record_from_template("perfevent_source_event",
+	event_recdef = ldms_record_from_template("linux_perf_event",
 						 event_tmp, p->event_metric_ids);
 	if (!event_recdef) {
 		rc = errno;
@@ -1701,6 +1720,7 @@ static int make_set(struct pe_sampler *p)
 					  p->events[i].unit);
 		ldms_record_set_double(rec, p->event_metric_ids[PE_EVENT_SCALE],
 				       p->events[i].scale);
+		/* Event arrays use the same index order as the instances list. */
 		for (j = 0; j < p->instance_count; j++) {
 			ldms_record_array_set_u64(rec,
 				p->event_metric_ids[PE_EVENT_COUNTS], j, 0);
@@ -1861,6 +1881,7 @@ static int sample(ldmsd_plug_handle_t handle)
 		}
 		rec = b->event->rec_mval;
 		inst_id = b->instance->instance_id;
+		/* counts/time arrays are indexed by instances[inst_id]. */
 		ldms_record_array_set_u64(rec,
 			p->event_metric_ids[PE_EVENT_COUNTS], inst_id, rv.value);
 		ldms_record_array_set_u64(rec,

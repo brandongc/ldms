@@ -23,13 +23,7 @@ libperfevent2_la_LIBADD = $(COMMON_LIBADD) -lm -lovis_json
 pkglib_LTLIBRARIES += libperfevent2.la
 dist_man7_MANS += ldms-sampler_perfevent2.man
 
-libperfevent_source_la_SOURCES = perfevent_source.c
-libperfevent_source_la_LIBADD = $(COMMON_LIBADD) -lm -lovis_json
-pkglib_LTLIBRARIES += libperfevent_source.la
-dist_man7_MANS += ldms-sampler_perfevent_source.man
-
 CLEANFILES = $(dist_man7_MANS)
 
 EXTRA_DIST = ldms-sampler_perfevent.rst \
-	     ldms-sampler_perfevent2.rst \
-	     ldms-sampler_perfevent_source.rst
+	     ldms-sampler_perfevent2.rst

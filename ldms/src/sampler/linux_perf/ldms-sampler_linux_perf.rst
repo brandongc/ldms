@@ -1,8 +1,8 @@
-.. _perfevent_source:
+.. _linux_perf:
 
-================
-perfevent_source
-================
+==========
+linux_perf
+==========
 
 ------------------------------------------------------
 ldmsd plugin for source-instance Linux perf PMU events
@@ -19,7 +19,7 @@ SYNOPSIS
 
 .. parsed-literal::
 
-   ``load`` ``name``\ =\ *PLUG_INST_NAME* ``plugin``\ =\ **perfevent_source**
+   ``load`` ``name``\ =\ *PLUG_INST_NAME* ``plugin``\ =\ **linux_perf**
 
    ``config`` ``name``\ =\ *PLUG_INST_NAME* ``producer``\ =\ *PRODUCER*
           ``instance``\ =\ *INSTANCE* ``conf``\ =\ *PERF_SOURCE_JSON*
@@ -29,11 +29,15 @@ SYNOPSIS
 DESCRIPTION
 ===========
 
-``perfevent_source`` samples one exact Linux perf PMU selected from
+``linux_perf`` samples one exact Linux perf PMU selected from
 ``/sys/bus/event_source/devices``. The sampler creates one LDMS source instance
 for each selected PMU binding CPU, rather than creating dense arrays sized by
 the total number of online CPUs. This keeps uncore PMU data compact and avoids
 unused CPU slots.
+
+The recommended LDMS set instance namespace is
+``<producer>/linux_perf/<pmu-or-role>``, for example
+``nid200251/linux_perf/amd_l3``.
 
 The sampler records raw perf counts and the kernel timing fields
 ``time_enabled`` and ``time_running``. It does not publish scaled or
@@ -108,6 +112,15 @@ For every event record, array slot ``i`` corresponds to ``instances[i]``.
 
 EXAMPLES
 ========
+
+LDMS configuration for AMD L3:
+
+.. code:: text
+
+   load name=linux_perf_amd_l3 plugin=linux_perf
+   config name=linux_perf_amd_l3 producer=nid200251 \
+          instance=nid200251/linux_perf/amd_l3 conf=/etc/ldms/linux_perf/amd_l3.json
+   start name=linux_perf_amd_l3 interval=1s offset=0
 
 Package energy:
 

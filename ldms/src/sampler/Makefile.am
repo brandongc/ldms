@@ -162,6 +162,7 @@ endif
 
 if ENABLE_PERFEVENT
 SUBDIRS += perfevent
+SUBDIRS += linux_perf
 endif
 
 if ENABLE_APPINFO
